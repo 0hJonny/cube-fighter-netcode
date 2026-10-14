@@ -6,6 +6,9 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Release)
 endif()
+# Windows: link the C++ runtime statically, so netfight.exe runs on a clean PC
+# without installing the Visual C++ Redistributable.
+set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 
 # --- Third-party: raylib (window, input, drawing). Not my code: fetched as-is. ---
 include(FetchContent)
@@ -40,6 +43,10 @@ endif()
 # --- Headless determinism test: two sims, same inputs, hashes must match ---
 add_executable(sim_test tests/sim_test.cpp)
 target_link_libraries(sim_test PRIVATE sim)
+
+# --- Gameplay rules test: combos, blocking, KO, timer ---
+add_executable(combat_test tests/combat_test.cpp)
+target_link_libraries(combat_test PRIVATE sim)
 
 # --- Network test: two sessions over real UDP on localhost must stay in sync ---
 add_executable(session_test tests/session_test.cpp)

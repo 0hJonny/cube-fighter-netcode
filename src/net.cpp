@@ -4,8 +4,12 @@
 #include <cstring>
 
 #ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
 #define NOMINMAX
+#endif
 #include <winsock2.h>
 #include <ws2tcpip.h>
 using sock_t = SOCKET;
@@ -67,7 +71,40 @@ bool UdpSocket::set_peer(const char* host, uint16_t port) {
   return true;
 }
 
+void UdpSocket::set_conditions(int lag_ms, int jitter_ms, int loss_percent) {
+  lag_ms_ = lag_ms;
+  jitter_ms_ = jitter_ms;
+  loss_percent_ = loss_percent;
+}
+
 void UdpSocket::send(const uint8_t* data, int len) {
+  flush_pending();
+  if (loss_percent_ > 0 && static_cast<int>(rng_() % 100) < loss_percent_) return;  // "lost"
+  if (lag_ms_ == 0 && jitter_ms_ == 0) {
+    send_now(data, len);
+    return;
+  }
+  int delay = lag_ms_;
+  if (jitter_ms_ > 0) delay += static_cast<int>(rng_() % (jitter_ms_ + 1));
+  pending_.push_back({Clock::now() + std::chrono::milliseconds(delay),
+                      std::vector<uint8_t>(data, data + len)});
+}
+
+void UdpSocket::flush_pending() {
+  // Jitter can make a later packet due earlier: scan all, which reorders them
+  // exactly like a real network can.
+  const auto now = Clock::now();
+  for (auto it = pending_.begin(); it != pending_.end();) {
+    if (it->release <= now) {
+      send_now(it->data.data(), static_cast<int>(it->data.size()));
+      it = pending_.erase(it);
+    } else {
+      ++it;
+    }
+  }
+}
+
+void UdpSocket::send_now(const uint8_t* data, int len) {
   if (fd_ == -1 || peer_len_ == 0) return;
   // Fire and forget: UDP gives no delivery guarantee, the protocol handles loss.
   sendto(static_cast<sock_t>(fd_), reinterpret_cast<const char*>(data), len, 0,
@@ -76,6 +113,7 @@ void UdpSocket::send(const uint8_t* data, int len) {
 
 int UdpSocket::recv(uint8_t* buf, int cap) {
   if (fd_ == -1) return -1;
+  flush_pending();
   const auto n = recvfrom(static_cast<sock_t>(fd_), reinterpret_cast<char*>(buf), cap, 0,
                           nullptr, nullptr);
   return n > 0 ? static_cast<int>(n) : -1;  // -1 also covers "would block"
