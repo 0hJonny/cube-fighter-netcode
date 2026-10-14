@@ -2,6 +2,8 @@ name: build
 
 on:
   push:
+    branches: ["**"]
+    tags: ["v*"]          # pushing a tag like v1.0.0 also publishes a GitHub Release
   pull_request:
   workflow_dispatch:
 
@@ -10,8 +12,14 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [windows-latest, macos-latest, ubuntu-latest]
+        include:
+          - { os: windows-latest, target: windows-x64 }
+          - { os: macos-latest,   target: macos-arm64 }
+          - { os: ubuntu-latest,  target: linux-x64 }
     runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        shell: bash
     steps:
       - uses: actions/checkout@v4
 
@@ -27,33 +35,80 @@ jobs:
       - name: Build
         run: cmake --build build --config Release --parallel
 
-      - name: Test (Windows)
-        if: runner.os == 'Windows'
-        shell: bash
+      - name: Test
         run: |
-          ./build/Release/sim_test.exe
-          ./build/Release/combat_test.exe
-          ./build/Release/session_test.exe
+          BIN=build; EXT=""
+          if [ "$RUNNER_OS" = "Windows" ]; then BIN=build/Release; EXT=.exe; fi
+          "$BIN/sim_test$EXT"
+          "$BIN/combat_test$EXT"
+          "$BIN/session_test$EXT"
 
-      - name: Test (macOS / Linux)
-        if: runner.os != 'Windows'
+      # Each archive contains the game, launch scripts for that OS, README and LICENSE.
+      - name: Package
         run: |
-          ./build/sim_test
-          ./build/combat_test
-          ./build/session_test
+          PKG=netfight-${{ matrix.target }}
+          mkdir "$PKG"
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            cp build/Release/netfight.exe "$PKG/"
+            cp scripts/*.bat "$PKG/"
+          else
+            cp build/netfight "$PKG/"
+            cp scripts/*.sh "$PKG/"
+            chmod +x "$PKG/netfight" "$PKG"/*.sh
+          fi
+          cp README.md LICENSE "$PKG/"
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            7z a -tzip "$PKG.zip" "./$PKG"
+          else
+            tar czf "$PKG.tar.gz" "$PKG"    # tar keeps the executable bit, zip does not
+          fi
 
-      - name: Package Windows build
-        if: runner.os == 'Windows'
-        shell: bash
-        run: |
-          mkdir netfight-windows
-          cp build/Release/netfight.exe netfight-windows/
-          cp scripts/*.bat netfight-windows/
-          cp README.md netfight-windows/
-
-      - name: Upload Windows build
-        if: runner.os == 'Windows'
+      - name: Upload
         uses: actions/upload-artifact@v4
         with:
-          name: netfight-windows
-          path: netfight-windows
+          name: netfight-${{ matrix.target }}
+          path: |
+            netfight-*.zip
+            netfight-*.tar.gz
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      # One checksum file for all archives: anyone can verify a download is
+      # exactly what CI built.
+      - name: Checksums
+        working-directory: dist
+        run: |
+          sha256sum netfight-* > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          body: |
+            Builds of netfight, tested in CI on each OS.
+
+            | OS | File |
+            |---|---|
+            | Windows 10/11 x64 | `netfight-windows-x64.zip` |
+            | macOS (Apple Silicon) | `netfight-macos-arm64.tar.gz` |
+            | Linux x64 (X11) | `netfight-linux-x64.tar.gz` |
+
+            Start with `play_online_localhost` (`.bat` / `.sh`): two windows connected over UDP.
+
+            Verify a download against `SHA256SUMS.txt`:
+            - Windows (PowerShell): `Get-FileHash netfight-windows-x64.zip -Algorithm SHA256`
+            - macOS / Linux: `shasum -a 256 -c SHA256SUMS.txt --ignore-missing`
+
+            macOS: the app is not signed. After unpacking run
+            `xattr -dr com.apple.quarantine netfight-macos-arm64` once.
