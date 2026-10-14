@@ -32,6 +32,7 @@ class LockstepSession {
   uint32_t ticks_since_packet() const { return ticks_since_packet_; }
   bool peer_seen() const { return peer_seen_; }
   uint32_t remote_latest() const { return remote_latest_; }
+  uint32_t restarts() const { return restarts_; }
 
  private:
   // Ring buffer of inputs indexed by frame. Each slot remembers which frame it
@@ -47,12 +48,19 @@ class LockstepSession {
     void set(uint32_t f, Input in) { slots[f % SIZE] = {f, in}; }
   };
 
-  void receive(uint32_t current_frame);
+  bool receive(uint32_t current_frame);  // true if the peer restarted
   void send_inputs(uint32_t newest_frame);
+  void reset_inputs();
 
   SessionConfig cfg_;
   UdpSocket sock_;
   InputRing local_, remote_;
+  // Random per process start. A different nonce from the peer means it was
+  // restarted, so its game is back at frame 0 and ours must restart too.
+  uint32_t my_nonce_ = 0;
+  uint32_t peer_nonce_ = 0;
+  uint32_t old_peer_nonce_ = 0;
+  uint32_t restarts_ = 0;
   uint32_t stalls_ = 0;
   uint32_t ticks_since_packet_ = 0;
   uint32_t remote_latest_ = 0;

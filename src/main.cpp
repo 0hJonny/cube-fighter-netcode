@@ -151,9 +151,10 @@ int main(int argc, char** argv) {
     DrawText(TextFormat("hash: %016llx", static_cast<unsigned long long>(sim_hash(state))), 10,
              36, 20, DARKGRAY);
     if (args.online) {
-      DrawText(TextFormat("player %d   input delay: %d frames   stalls: %u   peer frame: %u",
+      DrawText(TextFormat("player %d   input delay: %d   stalls: %u   peer frame: %u   "
+                          "rounds restarted: %u",
                           session.player(), session.input_delay(), session.stalls(),
-                          session.remote_latest()),
+                          session.remote_latest(), session.restarts()),
                10, 62, 20, DARKGRAY);
       if (!session.peer_seen()) {
         DrawText("waiting for peer...", 520, 300, 30, MAROON);
