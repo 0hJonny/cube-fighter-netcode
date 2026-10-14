@@ -1,0 +1,59 @@
+name: build
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libx11-dev libxrandr-dev libxinerama-dev libxcursor-dev libxi-dev libgl1-mesa-dev
+
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build --config Release --parallel
+
+      - name: Test (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          ./build/Release/sim_test.exe
+          ./build/Release/combat_test.exe
+          ./build/Release/session_test.exe
+
+      - name: Test (macOS / Linux)
+        if: runner.os != 'Windows'
+        run: |
+          ./build/sim_test
+          ./build/combat_test
+          ./build/session_test
+
+      - name: Package Windows build
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          mkdir netfight-windows
+          cp build/Release/netfight.exe netfight-windows/
+          cp scripts/*.bat netfight-windows/
+          cp README.md netfight-windows/
+
+      - name: Upload Windows build
+        if: runner.os == 'Windows'
+        uses: actions/upload-artifact@v4
+        with:
+          name: netfight-windows
+          path: netfight-windows
