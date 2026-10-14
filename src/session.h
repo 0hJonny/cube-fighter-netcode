@@ -80,7 +80,7 @@ class LockstepSession {
   };
 
   bool receive(uint32_t current_frame);  // true if the peer restarted
-  void send_inputs(uint32_t newest_frame);
+  void send_inputs(uint32_t newest_frame, uint32_t current_frame);
   void reset_round_state();
   void compare_hashes(uint32_t frame);
   uint32_t now_ms() const;
@@ -90,6 +90,7 @@ class LockstepSession {
   InputRing local_, remote_;
   HashRing local_hashes_, remote_hashes_;
   uint32_t latest_check_frame_ = UINT32_MAX;  // newest local checkpoint to advertise
+  uint32_t peer_ack_ = 0;  // peer's current frame: it needs our inputs from here on
 
   // Random per process start. A different nonce from the peer means it was
   // restarted, so its game is back at frame 0 and ours must restart too.

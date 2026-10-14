@@ -4,21 +4,33 @@
 
 namespace {
 
-// Packet layout, protocol v3. All little-endian, written byte by byte so the
+// Packet layout, protocol v5. All little-endian, written byte by byte so the
 // format does not depend on the CPU or on struct padding.
 //   [0..1]   magic 'N','F'        [2] version       [3] sender player
-//   [4..7]   sender nonce (random per launch, detects a restarted peer)
-//   [8..11]  sender timestamp, ms
-//   [12..15] echo: newest timestamp received from the receiver
-//   [16..17] echo hold time, ms (how long the sender sat on that timestamp)
-//   [18..21] checkpoint frame     [22..29] state hash at that frame
-//   [30..33] newest input frame   [34] count
-//   [35..]   inputs for frames newest-count+1 .. newest
-constexpr uint8_t MAGIC0 = 'N', MAGIC1 = 'F', VERSION = 3;
-constexpr int HEADER = 35;
-// Every packet repeats the last 8 frames of input, so a lost packet is covered
-// by the next one. Inputs are 1 byte, so redundancy costs almost nothing.
-constexpr uint32_t REDUNDANCY = 8;
+//   [4..7]   sender nonce: random per launch, detects a restarted peer
+//   [8..11]  receiver nonce: who this packet is for (0 = not known yet).
+//            Packets addressed to an older process of ours are ignored, so
+//            inputs, acks and hashes from a previous match never leak into
+//            the current one.
+//   [12..15] sender timestamp, ms
+//   [16..19] echo: newest timestamp received from the receiver
+//   [20..21] echo hold time, ms (how long the sender sat on that timestamp)
+//   [22..25] checkpoint frame     [26..33] state hash at that frame
+//   [34..37] newest input frame   [38] count
+//   [39..42] ack: the sender's current frame (it has all our inputs before it)
+//   [43..]   inputs for frames newest-count+1 .. newest
+constexpr uint8_t MAGIC0 = 'N', MAGIC1 = 'F', VERSION = 5;
+enum Offset : int {
+  OFF_FROM = 4, OFF_TO = 8, OFF_STAMP = 12, OFF_ECHO = 16, OFF_HOLD = 20,
+  OFF_CHECK_FRAME = 22, OFF_CHECK_HASH = 26, OFF_NEWEST = 34, OFF_COUNT = 38,
+  OFF_ACK = 39, HEADER = 43,
+};
+// Every packet repeats ALL inputs the peer has not acknowledged yet (up to the
+// ring size), so a lost packet is covered by the next one without any resend
+// timer. Inputs are 1 byte, so this costs almost nothing. A fixed window (say,
+// the last 8 frames) is not enough: if the peer falls behind by more than the
+// window, the frame it waits for is never sent again and both peers freeze.
+constexpr uint32_t MAX_WINDOW = 64;
 
 void put_u16(uint8_t* p, uint16_t v) {
   p[0] = static_cast<uint8_t>(v);
@@ -77,12 +89,11 @@ void LockstepSession::reset_round_state() {
   remote_latest_ = 0;
   desync_ = false;
   last_verified_ = 0;
-  // The first `input_delay` frames have no real input yet: both peers agree
-  // they are empty, so nobody waits for them.
-  for (uint32_t f = 0; f < static_cast<uint32_t>(cfg_.input_delay); ++f) {
-    local_.set(f, 0);
-    remote_.set(f, 0);
-  }
+  peer_ack_ = 0;
+  // Our first `input_delay` frames have no real input yet: they are empty.
+  // They are sent like any other input. We do NOT assume anything about the
+  // peer's first frames: its input delay may differ from ours.
+  for (uint32_t f = 0; f < static_cast<uint32_t>(cfg_.input_delay); ++f) local_.set(f, 0);
 }
 
 bool LockstepSession::tick(GameState& state, Input local_now) {
@@ -102,7 +113,7 @@ bool LockstepSession::tick(GameState& state, Input local_now) {
   if (!local_.has(target)) local_.set(target, local_now);
 
   // Send every tick, even while stalled: the peer may be waiting on us.
-  send_inputs(target);
+  send_inputs(target, frame);
 
   if (!remote_.has(frame)) {
     ++stalls_;
@@ -143,34 +154,37 @@ bool LockstepSession::receive(uint32_t current_frame) {
     // Validate before trusting anything: never trust bytes from the network.
     if (n < HEADER || buf[0] != MAGIC0 || buf[1] != MAGIC1 || buf[2] != VERSION) continue;
     if (buf[3] != 1 - cfg_.player) continue;
-    const uint32_t nonce = get_u32(buf + 4);
-    const uint32_t count = buf[34];
-    if (nonce == 0 || count == 0 || count > REDUNDANCY ||
-        n != HEADER + static_cast<int>(count)) {
-      continue;
-    }
-    if (nonce == old_peer_nonce_) continue;  // late packet from the dead process
-    if (peer_nonce_ != 0 && nonce != peer_nonce_) {
+    const uint32_t from = get_u32(buf + OFF_FROM);
+    const uint32_t to = get_u32(buf + OFF_TO);
+    const uint32_t count = buf[OFF_COUNT];
+    if (from == 0 || count > MAX_WINDOW || n != HEADER + static_cast<int>(count)) continue;
+
+    if (from == old_peer_nonce_) continue;  // late packet from the dead process
+    if (peer_nonce_ != 0 && from != peer_nonce_) {
       // New process on the other side. Everything we buffered from the old one
       // is meaningless; stop here and let tick() reset, then read again.
       old_peer_nonce_ = peer_nonce_;
-      peer_nonce_ = nonce;
+      peer_nonce_ = from;
       peer_stamp_ = 0;  // the new process's clock starts from zero again
       return true;
     }
-    peer_nonce_ = nonce;
+    peer_nonce_ = from;
     peer_seen_ = true;
     ticks_since_packet_ = 0;
+    // Not addressed to this process (yet): the peer still thinks it is talking
+    // to our previous incarnation, or has not heard from us. We learned its
+    // nonce above; its game data belongs to another match, so skip it.
+    if (to != my_nonce_) continue;
 
     // --- RTT / jitter ---
     const uint32_t now = now_ms();
-    const uint32_t stamp = get_u32(buf + 8);
+    const uint32_t stamp = get_u32(buf + OFF_STAMP);
     if (stamp > peer_stamp_) {  // newest only: jitter can reorder packets
       peer_stamp_ = stamp;
       peer_stamp_rx_ = now;
     }
-    const uint32_t echo = get_u32(buf + 12);
-    const uint32_t hold = get_u16(buf + 16);
+    const uint32_t echo = get_u32(buf + OFF_ECHO);
+    const uint32_t hold = get_u16(buf + OFF_HOLD);
     if (echo != 0 && now >= echo + hold) {
       const int sample = static_cast<int>(now - echo - hold);
       if (rtt_ms_ == 0) {
@@ -183,14 +197,17 @@ bool LockstepSession::receive(uint32_t current_frame) {
     }
 
     // --- desync detection ---
-    const uint32_t check_frame = get_u32(buf + 18);
+    const uint32_t check_frame = get_u32(buf + OFF_CHECK_FRAME);
     if (check_frame != UINT32_MAX) {
-      remote_hashes_.set(check_frame, get_u64(buf + 22));
+      remote_hashes_.set(check_frame, get_u64(buf + OFF_CHECK_HASH));
       compare_hashes(check_frame);
     }
 
     // --- inputs ---
-    const uint32_t newest = get_u32(buf + 30);
+    const uint32_t ack = get_u32(buf + OFF_ACK);
+    if (ack > peer_ack_) peer_ack_ = ack;  // max: reordered packets carry old acks
+    if (count == 0) continue;
+    const uint32_t newest = get_u32(buf + OFF_NEWEST);
     if (newest > remote_latest_) remote_latest_ = newest;
     for (uint32_t i = 0; i < count; ++i) {
       const uint32_t f = newest - (count - 1) + i;
@@ -203,25 +220,30 @@ bool LockstepSession::receive(uint32_t current_frame) {
   return false;
 }
 
-void LockstepSession::send_inputs(uint32_t newest) {
-  uint8_t buf[HEADER + REDUNDANCY];
-  const uint32_t count = newest + 1 < REDUNDANCY ? newest + 1 : REDUNDANCY;
+void LockstepSession::send_inputs(uint32_t newest, uint32_t current_frame) {
+  uint8_t buf[HEADER + MAX_WINDOW];
+  // Everything from the peer's ack up to our newest input, capped to the ring.
+  uint32_t start = peer_ack_;
+  if (newest + 1 > MAX_WINDOW && start < newest + 1 - MAX_WINDOW) start = newest + 1 - MAX_WINDOW;
+  const uint32_t count = start <= newest ? newest + 1 - start : 0;
   const uint32_t now = now_ms();
   buf[0] = MAGIC0;
   buf[1] = MAGIC1;
   buf[2] = VERSION;
   buf[3] = static_cast<uint8_t>(cfg_.player);
-  put_u32(buf + 4, my_nonce_);
-  put_u32(buf + 8, now);
-  put_u32(buf + 12, peer_stamp_);
+  put_u32(buf + OFF_FROM, my_nonce_);
+  put_u32(buf + OFF_TO, peer_nonce_);
+  put_u32(buf + OFF_STAMP, now);
+  put_u32(buf + OFF_ECHO, peer_stamp_);
   const uint32_t hold = peer_stamp_ != 0 ? now - peer_stamp_rx_ : 0;
-  put_u16(buf + 16, static_cast<uint16_t>(hold > 65535 ? 65535 : hold));
+  put_u16(buf + OFF_HOLD, static_cast<uint16_t>(hold > 65535 ? 65535 : hold));
   uint64_t check_hash = 0;
   if (latest_check_frame_ != UINT32_MAX) local_hashes_.get(latest_check_frame_, check_hash);
-  put_u32(buf + 18, latest_check_frame_);
-  put_u64(buf + 22, check_hash);
-  put_u32(buf + 30, newest);
-  buf[34] = static_cast<uint8_t>(count);
+  put_u32(buf + OFF_CHECK_FRAME, latest_check_frame_);
+  put_u64(buf + OFF_CHECK_HASH, check_hash);
+  put_u32(buf + OFF_NEWEST, newest);
+  buf[OFF_COUNT] = static_cast<uint8_t>(count);
+  put_u32(buf + OFF_ACK, current_frame);
   for (uint32_t i = 0; i < count; ++i) buf[HEADER + i] = local_.get(newest - (count - 1) + i);
   sock_.send(buf, HEADER + static_cast<int>(count));
 }

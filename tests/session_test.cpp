@@ -5,6 +5,7 @@
 //     and stay in sync (regression test for the reconnect bug).
 //  3. A corrupted local state must be reported as a desync by hash exchange.
 //  4. Bad network (lag, jitter = reordering, 20% packet loss): still in sync.
+//  5. Different input delays per peer under heavy loss: no freeze, no desync.
 #include <chrono>
 #include <cstdio>
 #include <memory>
@@ -143,6 +144,40 @@ int main() {
   }
   std::printf("OK   bad network: frames %u/%u, both verified in sync up to frame %u\n",
               sx.frame, sy.frame, verified);
+  // --- 5. different input delays on each side (1 vs 10 frames) + 30% loss ---
+  // Regression: a fixed 8-frame resend window froze when one peer fell more
+  // than 8 frames behind, and pre-filling the PEER's first frames with empty
+  // input desynced when the delays differed.
+  {
+    SessionConfig d0 = make_cfg(0, 7120), d1 = make_cfg(1, 7120);
+    d0.input_delay = 1;
+    d1.input_delay = 10;
+    for (SessionConfig* c : {&d0, &d1}) {
+      c->lag_ms = 30;
+      c->jitter_ms = 10;
+      c->loss_percent = 30;
+    }
+    LockstepSession p, q;
+    if (!p.start(d0) || !q.start(d1)) {
+      std::printf("FAIL: could not open sockets\n");
+      return 1;
+    }
+    GameState sp = sim_init(), sq = sim_init();
+    for (int round = 0; round < 60000 && (sp.frame < 300 || sq.frame < 300); ++round) {
+      p.tick(sp, rnd(seed_a));
+      if (round % 3 != 0) q.tick(sq, rnd(seed_b));
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    const uint32_t v = p.last_verified_frame() < q.last_verified_frame() ? p.last_verified_frame()
+                                                                         : q.last_verified_frame();
+    if (sp.frame < 300 || sq.frame < 300 || p.desynced() || q.desynced() || v < 240) {
+      std::printf("FAIL mixed delays: frames %u/%u, verified to %u, desync %d/%d\n", sp.frame,
+                  sq.frame, v, p.desynced(), q.desynced());
+      return 1;
+    }
+    std::printf("OK   delays 1 vs 10 frames + 30%% loss: in sync up to frame %u\n", v);
+  }
+
   std::printf("OK   measured RTT %d ms, jitter %d ms (configured 2 x (40 + 0..30) ms)\n",
               x.rtt_ms(), x.jitter_ms());
   return 0;
