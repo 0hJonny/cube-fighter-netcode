@@ -1,8 +1,15 @@
-// Stage 1: local two-player build. Window + fixed 60 Hz simulation + rendering.
-// Networking replaces read_local_inputs() in stage 3; the sim does not change.
+// netfight: two cubes, deterministic lockstep over UDP.
+//
+//   local (one keyboard): ./netfight
+//   online, window A:     ./netfight --player 0 --port 7000 --peer 127.0.0.1:7001
+//   online, window B:     ./netfight --player 1 --port 7001 --peer 127.0.0.1:7000
 #include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <string>
 
 #include "raylib.h"
+#include "session.h"
 #include "sim.h"
 
 namespace {
@@ -38,18 +45,65 @@ void draw_fighter(const Fighter& p, Color body) {
   const Vector3 pos = to_world(p);
   DrawCube(pos, 1.0f, 1.0f, 1.0f, body);
   DrawCubeWires(pos, 1.0f, 1.0f, 1.0f, BLACK);
-  // Small "nose" shows facing direction.
   DrawCube({pos.x + 0.55f * p.facing, pos.y + 0.2f, 0.0f}, 0.2f, 0.2f, 0.2f, DARKGRAY);
+}
+
+struct Args {
+  bool online = false;
+  SessionConfig cfg;
+  std::string peer_host = "127.0.0.1";
+};
+
+bool parse_args(int argc, char** argv, Args& a) {
+  for (int i = 1; i < argc; ++i) {
+    const bool has_value = i + 1 < argc;
+    if (!std::strcmp(argv[i], "--player") && has_value) {
+      a.cfg.player = std::atoi(argv[++i]);
+    } else if (!std::strcmp(argv[i], "--port") && has_value) {
+      a.cfg.local_port = static_cast<uint16_t>(std::atoi(argv[++i]));
+    } else if (!std::strcmp(argv[i], "--delay") && has_value) {
+      a.cfg.input_delay = std::atoi(argv[++i]);
+    } else if (!std::strcmp(argv[i], "--peer") && has_value) {
+      const std::string peer = argv[++i];  // host:port
+      const auto colon = peer.rfind(':');
+      if (colon == std::string::npos) return false;
+      a.peer_host = peer.substr(0, colon);
+      a.cfg.peer_port = static_cast<uint16_t>(std::atoi(peer.c_str() + colon + 1));
+      a.online = true;
+    } else {
+      return false;
+    }
+  }
+  if (a.cfg.player != 0 && a.cfg.player != 1) return false;
+  if (a.cfg.input_delay < 0 || a.cfg.input_delay > 30) return false;
+  return true;
 }
 
 }  // namespace
 
-int main() {
-  SetConfigFlags(FLAG_MSAA_4X_HINT);
-  InitWindow(1280, 720, "netfight - stage 1 (local)");
+int main(int argc, char** argv) {
+  Args args;
+  if (!parse_args(argc, argv, args)) {
+    std::fprintf(stderr,
+                 "usage: netfight [--player 0|1 --port N --peer host:port [--delay frames]]\n");
+    return 1;
+  }
 
-  // Render FPS is deliberately decoupled from the 60 Hz tick: F1 cycles it so the
-  // video can show the simulation speed does not change with frame rate.
+  LockstepSession session;
+  if (args.online) {
+    args.cfg.peer_host = args.peer_host.c_str();
+    if (!session.start(args.cfg)) {
+      std::fprintf(stderr, "failed to start network session\n");
+      return 1;
+    }
+  }
+
+  SetConfigFlags(FLAG_MSAA_4X_HINT);
+  const char* title = !args.online ? "netfight - local"
+                      : args.cfg.player == 0 ? "netfight - player 0 (blue)"
+                                             : "netfight - player 1 (orange)";
+  InitWindow(1280, 720, title);
+
   const int fps_options[] = {30, 60, 144};
   int fps_idx = 1;
   SetTargetFPS(fps_options[fps_idx]);
@@ -69,14 +123,16 @@ int main() {
       fps_idx = (fps_idx + 1) % 3;
       SetTargetFPS(fps_options[fps_idx]);
     }
-    if (IsKeyPressed(KEY_F5)) state = sim_init();
+    if (!args.online && IsKeyPressed(KEY_F5)) state = sim_init();
 
-    // Fixed timestep: run as many 1/60 s ticks as real time has accumulated.
-    // Clamp prevents a "spiral of death" after a long stall (window drag, breakpoint).
     accumulator += GetFrameTime();
     if (accumulator > 0.25) accumulator = 0.25;
     while (accumulator >= TICK_DT) {
-      sim_step(state, read_p1(), read_p2());
+      if (args.online) {
+        session.tick(state, read_p1());  // in online mode you always use WASD/JK
+      } else {
+        sim_step(state, read_p1(), read_p2());
+      }
       accumulator -= TICK_DT;
     }
 
@@ -94,7 +150,20 @@ int main() {
              10, 10, 20, DARKGRAY);
     DrawText(TextFormat("hash: %016llx", static_cast<unsigned long long>(sim_hash(state))), 10,
              36, 20, DARKGRAY);
-    DrawText("P1: A/D W J/K    P2: arrows , .    F5: reset", 10, 690, 20, GRAY);
+    if (args.online) {
+      DrawText(TextFormat("player %d   input delay: %d frames   stalls: %u   peer frame: %u",
+                          session.player(), session.input_delay(), session.stalls(),
+                          session.remote_latest()),
+               10, 62, 20, DARKGRAY);
+      if (!session.peer_seen()) {
+        DrawText("waiting for peer...", 520, 300, 30, MAROON);
+      } else if (session.ticks_since_packet() > TICK_RATE) {
+        DrawText("connection lost - waiting...", 450, 300, 30, MAROON);
+      }
+      DrawText("you: A/D move, W jump, J/K attack", 10, 690, 20, GRAY);
+    } else {
+      DrawText("P1: A/D W J/K    P2: arrows , .    F5: reset", 10, 690, 20, GRAY);
+    }
     EndDrawing();
   }
 
