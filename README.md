@@ -165,6 +165,21 @@ players used different `--delay` values.
 
 CI builds and runs all tests on Windows, macOS and Linux.
 
+### Demo video: recorded by a script
+
+`tools/record_demo.sh` records the demo video with no human at the keyboard.
+Two real game windows run side by side on a virtual display (Xvfb) and talk
+over real UDP; `xdotool` plays a fixed script of key presses (a tiny TAS);
+`ffmpeg` records the screen, adds title and end cards and burns in captions
+(`tools/add_captions.sh`). Linux only; needs Xvfb, xdotool and ffmpeg.
+
+It doubles as an end-to-end test of things one person at one keyboard cannot
+check, such as blocking: P2 has to hold "back" in its own window while P1
+attacks in the other. Doing that revealed a detail of the test setup: a window
+that loses focus releases all its keys, so the script sends P2's key to its
+window without moving focus. Caption timings were checked against the recorded
+frames (hit flash, blockstun, the DESYNC message).
+
 ## Trade-offs and next steps
 
 - **Rollback instead of input delay.** Lockstep with delay is simple and correct,
@@ -193,8 +208,9 @@ CI builds and runs all tests on Windows, macOS and Linux.
 ## Use of generative AI
 
 This project was built with an AI assistant (Claude, by Anthropic). The AI wrote
-the code for all files in `src/`, `tests/`, the CI workflow and scripts, and
-drafted this README. My part: setting the goal and scope, discussing and choosing
+the code for all files in `src/`, `tests/`, `tools/`, the CI workflow and
+scripts, recorded the demo video with `tools/record_demo.sh` (scripted inputs),
+and drafted this README. My part: setting the goal and scope, discussing and choosing
 the approach (lockstep vs. rollback, fixed-point math, input redundancy,
 frame-indexed buffers), building and testing every stage on my machine, finding
 bugs in manual testing (the peer-restart freeze and the freeze/desync with
